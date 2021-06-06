@@ -1,0 +1,140 @@
+---
+title: "Growth Rate Modeling"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(skimr)
+library(brms)
+```
+
+```{r}
+style <- read_csv("../input/Styleelongation2017_ZTslh.csv") %>%
+  na.omit()
+style
+```
+
+```{r}
+style <- style %>% rename(trt=treatment, length=`length (mm)`) %>%
+  mutate(minute=as.numeric(time-min(time)) / 60 + 1,  # elapsed minutes, first minute = 1
+         id=str_c(floret,day,trt,sep="-"))  # unique id for each floret
+style %>% mutate(trt=as.factor(trt)) %>% skim()
+unique(style$trt)
+```
+
+```{r}
+table(style$day, style$floret)
+```
+
+```{r}
+table(style$day, style$minute)
+```
+
+```{r}
+style %>%
+  ggplot(aes(x=time, y=length, color=trt, shape=as.character(floret))) +
+  geom_point() +
+  facet_wrap(~day)
+```
+
+```{r}
+style %>%
+  ggplot(aes(x=time, y=length, color=trt)) +
+  geom_smooth() +
+  facet_wrap(~day)
+```
+
+```{r}
+style %>%
+  ggplot(aes(x=time, y=length, color=trt)) +
+  geom_smooth()
+```
+
+## Weibull fit
+
+Try weibull (see http://www.pisces-conservation.com/growthhelp/index.html?weibul.htm ) 
+
+### prior predictions
+
+To help figure out reasonable priors
+
+```{r}
+weibull <- function(Lmin, Lmax, k, delta, minute) {
+  y <- Lmax - (Lmax - Lmin) * exp(-(k*minute)^delta)
+  tibble(minute=minute, y=y)
+}
+```
+
+set up tibble with some priors
+
+```{r}
+x <- seq(0,.2,.01)
+plot(x, dexp(x,50), type = "l")
+```
+
+
+```{r}
+tibble(
+  Lmin=rnorm(50, 7.5, 1),
+  Lmax=rnorm(50, 10, 1),
+  k=rexp(50,50),
+  delta=rnorm(50,1,.5)) %>%
+  mutate(delta=ifelse(delta < 0, 0, delta)) %>%
+  
+  mutate(prediction=pmap(list(Lmin, Lmax, k, delta), weibull, 1:230 ),
+         sample=row_number()) %>%
+  unnest(prediction) %>%
+
+  ggplot(aes(x=minute,y=y, group=sample)) +
+  geom_line(alpha=.2)
+```
+
+
+### minimal 
+
+First set up the formula
+```{r}
+weibull.bf1 <- bf(
+  length ~ Lmax - (Lmax - Lmin) * exp(-(k*minute)^delta), #Weibull model
+  Lmax + Lmin + k + delta ~ 1, #minimal model, parameters do not vary for treatment or random effects
+  nl=TRUE)
+```
+
+Priors.  
+```{r}
+prior1 <- c(prior(normal(7.5,2), nlpar="Lmin"),
+            prior(normal(10,2),nlpar="Lmax"),
+            prior(normal(0,.1),nlpar="k"),
+            prior(normal(1,2),nlpar="delta")) # 1 is exponential model
+```
+
+### prior preditctions for model 1
+
+```{r}
+fit1 <- brm(formula=weibull.bf1,
+            data=style,
+            prior=prior1,
+            cores=1,
+            chains=1,
+            sample_prior = "only")
+```
+
+```{r}
+pred1 <- predict(fit1)
+plot(x=pred1[,"Estimate"], y=style$minute)
+```
+
+
+```{r}
+summary(fit1)
+```
+
+```{r}
+plot(fit1)
+```
+
+```{r}
+pairs(fit1)
+```
+

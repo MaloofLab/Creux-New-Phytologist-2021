@@ -1,0 +1,293 @@
+---
+title: "Brms height"
+output: html_notebook
+---
+
+Trying to fit non-linear model with BRMS
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(stringr)
+library(magrittr)
+library(brms)
+```
+
+```{r}
+data <- read_csv("F2_Phenotype_Bnapus_all.csv") # file that was output from "Format_Additional_414_data.Rmd"
+data
+sowing_date <- ymd("150909") # From "Additional F2 Data.xls"
+```
+
+```{r}
+data.t <- as_tibble(t(data[,-1]))
+colnames(data.t) <- data$PHENOTYPE
+data.t$ID <- colnames(data)[-1] 
+data.t <- data.t %>% select(ID, everything())
+data.t
+```
+
+## Plant height phenotypes
+
+```{r}
+heights <- data.t %>% select(ID, contains("height")) %>%
+  gather(key=date, value=height, -ID) %>%
+  mutate(date=str_replace(date, "plant_height_","") %>% ymd(), days=as.numeric(date-min(date)+1) )
+heights
+```
+
+Plot
+```{r}
+heights %>% ggplot(aes(x=date, y=height,group=ID)) +
+  geom_line(alpha=.1) + ggtitle("414 height by date")
+```
+
+Example from BRMS vignette
+```{r}
+b <- c(2, 0.75)
+x <- rnorm(100)
+y <- rnorm(100, mean = b[1] * exp(b[2] * x))
+dat1 <- data.frame(x, y)
+```
+
+```{r}
+library(brms)
+prior1 <- c(prior(normal(1, 2), nlpar = "b1"),
+            prior(normal(0, 2), nlpar = "b2"))
+fit1 <- brm(bf(y ~ b1 * exp(b2 * x), b1 + b2 ~ 1, nl = TRUE),
+            data = dat1, prior = prior1
+)
+```
+
+Try weibull (see http://www.pisces-conservation.com/growthhelp/index.html?weibul.htm ) 
+
+First set up the formula
+```{r}
+weibull.bf1 <- bf(
+  height ~ Hmax - (Hmax - Hmin) * exp(-(k*days)^delta), #Weibull model
+  Hmax + Hmin + k + delta ~ 1, #general model, paramters do not vary for individuals
+  nl=TRUE)
+```
+
+Priors.  This is the hard part.  Hmin and Hmax are easy, use median at start and end dates.
+```{r}
+heights %>% 
+  group_by(days) %>%
+  summarize(median=median(height))
+  
+prior1 <- c(prior(normal(15,5), nlpar="Hmin"),
+            prior(normal(170,10),nlpar="Hmax"),
+            prior(normal(0,.1),nlpar="k"),
+            prior(normal(4,2),nlpar="delta"))
+```
+
+```{r}
+fit1 <- brm(formula=weibull.bf1,
+            data=heights,
+            prior=prior1,
+            cores=4)
+```
+
+```{r}
+summary(fit1)
+```
+
+```{r}
+plot(fit1)
+```
+
+```{r}
+pairs(fit1)
+```
+
+So with these priors it seems that the model can flip between having high and low Hmin and Hmax.  This relates to the delta parameter flipping signs.  So one possibility is to keep delta positive.  Or more tightly constrain the priors on Hmax and Hmin.
+
+```{r}
+prior2 <- c(prior(normal(15,5), nlpar="Hmin"),
+            prior(normal(170,10),nlpar="Hmax"),
+            prior(normal(0,.1),nlpar="k"),
+            prior(normal(4,2),nlpar="delta",lb=0))
+```
+
+
+```{r}
+fit2 <- brm(formula=weibull.bf1,
+             data=heights,
+             prior=prior2,
+             cores=4)
+```
+
+```{r}
+summary(fit2)
+```
+
+```{r}
+plot(fit2)
+pairs(fit2)
+```
+
+Let's rescale k to get it a bit more reasonable
+
+```{r}
+weibull.bf2 <- bf(
+  height ~ Hmax - (Hmax - Hmin) * exp(-((k/100)*days)^delta), #Weibull model
+  Hmax + Hmin + k + delta ~ 1, #general model, paramters do not vary for individuals
+  nl=TRUE)
+
+prior3 <- c(prior(normal(15,5), nlpar="Hmin"),
+            prior(normal(170,10),nlpar="Hmax"),
+            prior(normal(0,1),nlpar="k"),
+            prior(normal(2,1),nlpar="delta",lb=0),
+            prior(cauchy(0,1),class="sigma"))
+```
+
+
+```{r}
+fit3 <- brm(formula=weibull.bf2,
+             data=heights,
+             prior=prior3,
+             cores=4)
+```
+
+```{r}
+summary(fit3)
+```
+
+```{r}
+plot(fit3)
+pairs(fit3)
+```
+
+
+What does the fit look like?
+
+```{r}
+newdata <- data.frame(days=seq(min(heights$days), max(heights$days),1))
+fit3.fitted <-  cbind(newdata,fitted(fit3,newdata)) %>%
+  as.tibble() %>%
+  rename(height=Estimate,lower.ci=`2.5%ile`,upper.ci=`97.5%ile`)
+```
+
+plot it...
+```{r}
+pl <- ggplot(aes(x=days,y=height),data=NULL)
+pl <- pl + geom_line(aes(group=ID),alpha=.1,data=heights)
+pl + geom_line(color="skyblue",lwd=2,data=fit3.fitted)
+```
+
+Now try adding random effects for model parameters:
+
+What parameters do we think might be interesting to allow to vary?  Probably not Hmin.  Try making a series of plots to see how varying delta or k affects things:
+
+```{r}
+weibull.fn <- function(Hmax,Hmin,k,delta,days) {
+    Hmax - (Hmax - Hmin) * exp(-((k/100)*days)^delta) #Weibull model
+}
+for(delta in seq(.5,3,.5)) {
+  tmp.heights <- weibull.fn(Hmax=168,
+                            Hmin=16,
+                            k=1.42,
+                            delta = delta,
+                            days=newdata$days)
+  print(plot(newdata$days,tmp.heights,main=delta,type="l"))
+}
+```
+
+```{r}
+for(k in seq(1,3,.5)) {
+  tmp.heights <- weibull.fn(Hmax=168,
+                            Hmin=16,
+                            k=k,
+                            delta = 2.13,
+                            days=newdata$days)
+  print(plot(newdata$days,tmp.heights,main=k,type="l"))
+}
+```
+
+First try with only fixing Hmin
+
+```{r}
+weibull.bf3 <- bf(
+  height ~ Hmax - (Hmax - Hmin) * exp(-((k/100)*days)^delta), #Weibull model
+  Hmax + k + delta ~ (1|ID), # vary for individuals
+  Hmin ~ 1, # do not vary per individual
+  nl=TRUE)
+```
+
+```{r}
+prior4 <- c(prior(normal(15,5), nlpar="Hmin"),
+            prior(normal(170,10),nlpar="Hmax"),
+            prior(normal(0,1),nlpar="k"),
+            prior(normal(2,1),nlpar="delta",lb=0),
+            prior(cauchy(0,1), class=sigma),
+            prior(cauchy(0,10),class=sd,nlpar="Hmax"),
+            prior(cauchy(0,1),class=sd,nlpar="delta"),
+            prior(cauchy(0,1),class=sd,nlpar="k"))
+```
+
+
+```{r}
+fit5 <- brm(formula = weibull.bf3,
+            data=heights,
+            prior=prior4,
+            cores=4#,
+            # inits=list(list(Hmin=runif(1,5,15),
+            #                        Hmax=runif(1,150,190),
+            #                        k=runif(1,0.1,1),
+            #                        delta=runif(1,0.1,4),
+            #                        sigma=runif(1,1,10),
+            #                        sd=runif(1,1,10)),
+            #            list(Hmin=runif(1,5,15),
+            #                        Hmax=runif(1,150,190),
+            #                        k=runif(1,0.1,1),
+            #                        delta=runif(1,0.1,4),
+            #                        sigma=runif(1,1,10),
+            #                        sd=runif(1,1,10)),
+            #            list(Hmin=runif(1,5,15),
+            #                        Hmax=runif(1,150,190),
+            #                        k=runif(1,0.1,1),
+            #                        delta=runif(1,0.1,4),
+            #                        sigma=runif(1,1,10),
+            #                        sd=runif(1,1,10)),
+            #            list(Hmin=runif(1,5,15),
+            #                        Hmax=runif(1,150,190),
+            #                        k=runif(1,0.1,1),
+            #                        delta=runif(1,0.1,4),
+            #                        sigma=runif(1,1,10),
+            #                        sd=runif(1,1,10)))
+)
+```
+
+
+
+```{r}
+summary(fit5)
+```
+
+get fitted values
+```{r}
+fit5.fitted <- cbind(heights,fitted(fit5)) %>% as.tibble()
+fit5.fitted
+```
+
+plot 12
+```{r}
+fit5.fitted %>% filter(grepl("_([1-9]|1[0-4])$",ID)) %>%
+  ggplot(aes(x=days)) +
+  geom_line(aes(y=height),color="blue") +
+  geom_line(aes(y=Estimate),color="red") +
+  facet_wrap(~ID)
+```
+
+plot fitted vs actual:
+
+```{r}
+fit5.fitted %>%
+  mutate(days=as.factor(days)) %>%
+  ggplot(aes(x=height,y=Estimate,shape=days,color=days)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope=1)
+```
+
+So not perfect.  Under-predicts the tallest plants at 148.  Over predicts the small 62 day plants and under=predicts the large 62 day plants.
+
