@@ -521,10 +521,6 @@ pred_4c %>%
 loo_compare(fit1c, fit2c, fit3c, fit_4c)
 ```
 
-```{r}
-save.image(file="../output/models.Rdata")
-```
-
 
 ## fit_5c: k + delta ~ trt + (1|id); Lmax ~ 1|day
 
@@ -734,9 +730,11 @@ pred_6c %>%
 ggsave("../output/style_fit_plot.pdf", width=6.5, height = 4)
 ```
 
+
 ```{r}
 save.image("../output/StyleModelFits.Rdata")
 ```
+
 
 
 ## compare models
