@@ -1,0 +1,852 @@
+---
+title: "Anther growth models"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(skimr)
+library(brms)
+```
+
+## Data import and wrangle
+
+```{r}
+anther <- read_csv("../input/Antherelongation2017.csv") %>%
+  rename_with(tolower) %>% 
+  complete(day, floret, treatment, time)
+```
+```{r}
+anther <- anther %>% rename(trt=treatment, length=`length (mm)`) %>%
+  mutate(hour=as.numeric(time-min(time)) / 3600,  # elapsed hours, first hour = 0
+         id=str_c(floret,day,trt,sep="-"))  # unique id for each floret
+anther %>% mutate(trt=as.factor(trt)) %>% skim()
+unique(anther$trt)
+```
+
+Plot to see what we have:
+```{r}
+anther %>%
+  ggplot(aes(x=time, y=length, color=trt, shape=as.character(floret))) +
+  geom_point() +
+  facet_wrap(~day)
+```
+
+
+Fix height to max height.  This is necessary because our growth model can't account for shrinkage after reaching max height.  Fill in missing end-of-series values, but note that they are censored.
+```{r}
+anther <- anther %>% 
+  mutate(censored = ifelse(is.na(length), "right", "none")) %>%
+  group_by(id) %>%
+  arrange(hour) %>% 
+  mutate(length2=ifelse((length < max(length, na.rm = TRUE) | is.na(length)) & row_number() > which.max(length),
+                       max(length, na.rm = TRUE), length)) %>%
+  ungroup() %>%
+  filter(!is.na(length2))
+```
+
+Plot smoothed data
+```{r}
+anther %>%
+  ggplot(aes(x=time, y=length2, color=trt)) +
+  geom_smooth() +
+  facet_wrap(~day)
+```
+
+And plot averaged over days:
+```{r}
+anther %>%
+  ggplot(aes(x=time, y=length2, color=trt)) +
+  geom_smooth()
+```
+
+### prior predictions
+
+To help figure out reasonable priors
+
+```{r}
+weibull <- function(Lmin, Lmax, k, delta, hour) {
+  y <- Lmax - (Lmax - Lmin) * exp(-(k*hour)^delta)
+  tibble(hour=hour, y=y)
+}
+```
+
+set up tibble with some priors
+
+```{r}
+x <- seq(0,1,.01)
+plot(x, dexp(x,1), type = "l")
+```
+
+k only 
+```{r}
+tibble(
+  Lmin=7.5,#rnorm(50, 7.5, 1),
+  Lmax=11.5,#rnorm(50, 11.5, 1),
+  k=rexp(50,1),
+  delta=1) %>% #rnorm(50,1,.5)) %>%
+  mutate(delta=ifelse(delta < 0, 0, delta)) %>%
+  
+  mutate(prediction=pmap(list(Lmin, Lmax, k, delta), weibull, seq(0,4.5,.1) ),
+         sample=row_number()) %>%
+  unnest(prediction) %>%
+
+  ggplot(aes(x=hour,y=y, group=sample)) +
+  geom_line(alpha=.2)
+```
+delta only
+```{r}
+tibble(
+  Lmin=7.5,#rnorm(50, 7.5, 1),
+  Lmax=11.5,#rnorm(50, 11.5, 1),
+  k=.5,
+  delta=rexp(50,.5)) %>%
+  mutate(prediction=pmap(list(Lmin, Lmax, k, delta), weibull, seq(0,4.5,.1) ),
+         sample=row_number()) %>%
+  unnest(prediction) %>%
+
+  ggplot(aes(x=hour,y=y, group=sample)) +
+  geom_line(alpha=.2)
+```
+
+delta and k
+```{r}
+tibble(
+  Lmin=7.5,#rnorm(50, 7.5, 1),
+  Lmax=11.5,#rnorm(50, 11.5, 1),
+  k=rexp(100, 1),
+  delta=rexp(100,.5)) %>%
+  mutate(prediction=pmap(list(Lmin, Lmax, k, delta), weibull, seq(0,4.5,.1) ),
+         sample=row_number()) %>%
+  unnest(prediction) %>%
+
+  ggplot(aes(x=hour,y=y, group=sample)) +
+  geom_line(alpha=.2)
+```
+
+all together
+```{r}
+tibble(
+  Lmin=rnorm(100, 7.5, .25),
+  Lmax=rnorm(100, 11.5, .25),
+  k=rexp(100, 1),
+  delta=rexp(100, 0.5)) %>%
+  mutate(prediction=pmap(list(Lmin, Lmax, k, delta), weibull, seq(0,4.5,.1) ),
+         sample=row_number()) %>%
+  unnest(prediction) %>%
+
+  ggplot(aes(x=hour,y=y, group=sample)) +
+  geom_line(alpha=.2)
+```
+
+# models
+
+## priors
+
+what priors are available to be set?
+
+```{r}
+get_prior(bf(
+    length2 | cens(censored) ~ Lmax - (Lmax - Lmin) * exp(-(k*hour)^delta), #Weibull model
+    Lmax + Lmin ~ 1, 
+    delta + k ~ trt + (1|id),
+    nl=TRUE ),
+  data=anther)
+```
+
+## minimal 
+
+```{r}
+prior1 <- c(prior(normal(7.5,.25), nlpar="Lmin"),
+            prior(normal(11.5, .25),nlpar="Lmax"),
+            prior(exponential(1),nlpar="k", lb=0),
+            prior(exponential(.5),nlpar="delta", lb=0) # 1 is exponential model
+)
+
+fit1c <- brm(
+  formula=bf(
+    length2 | cens(censored) ~ Lmax - (Lmax - Lmin) * exp(-(k*hour)^delta), #Weibull model
+    Lmax + Lmin + k + delta ~ 1, #minimal model, parameters do not vary for treatment or random effects
+    nl=TRUE),
+  data=anther,
+  prior=prior1,
+  sample_prior = "yes",
+  cores=4,
+  chains=4)
+gc()
+fit1c <- add_criterion(fit1c, "loo")
+```
+
+
+```{r}
+summary(fit1c)
+gc()
+```
+
+```{r}
+plot(fit1c)
+gc()
+```
+
+```{r}
+pairs(fit1c)
+gc()
+```
+
+```{r}
+pred1c <- predict(fit1c)
+gc()
+```
+
+```{r}
+pred1c <- cbind(pred1c, anther)
+
+pred1c %>% ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_smooth(span=1) +
+  geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_line(aes(y=Estimate),color="yellow") 
+```
+
+```{r}
+pp_check(fit1c)
+```
+
+## fit2c:
+
+```{r, eval=TRUE}
+
+prior2 <- c(prior(normal(7.5,.25), nlpar="Lmin"),
+            prior(normal(11.5, .25),nlpar="Lmax"),
+            prior(exponential(1),nlpar="k", lb=0),
+            prior(exponential(0.5),nlpar="delta"), # 1 is exponential model
+            prior(normal(0,0.5), nlpar="delta", coef="trtWest"),
+            prior(normal(0,0.5), nlpar="delta", coef="trtWestHeat")
+)
+
+fit2c <- brm( # ignore the warning about lower bounds.  If we set it for the intercept, it impacts the other delta coefficients and we don't want that.
+  formula=bf(
+    length2 | cens(censored) ~ Lmax - (Lmax - Lmin) * exp(-(k*hour)^delta), #Weibull model
+    Lmax + Lmin + k ~ 1, 
+    delta ~ trt + (1|id),   # 
+    nl=TRUE ),
+  data=anther,
+  prior=prior2,
+  sample_prior = "yes",
+  cores=4,
+  chains=4,
+  iter=5000 #,
+  #control=list(adapt_delta=0.9)
+  )
+
+fit2c <- add_criterion(fit2c, "loo")
+
+gc()
+```
+
+```{r}
+summary(fit2c)
+gc()
+```
+
+
+```{r, fig.height=10}
+plot(fit2c, ask = FALSE)
+gc()
+```
+
+```{r}
+plot(conditional_effects(fit2c), ask=FALSE)
+pp_check(fit2c)
+```
+
+```{r}
+pred2c <- predict(fit2c)
+pred2c %>%
+  cbind(anther) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_smooth(span=1) +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_smooth(aes(y=Estimate), lty=2, span=1) 
+```
+
+```{r}
+pred2c %>%
+  cbind(anther) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_smooth(span=1) +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_smooth(aes(y=Estimate), lty=2, span=1)  +
+  facet_wrap(~day, scales = "free_y")
+```
+
+
+```{r}
+pred2c %>%
+  cbind(anther) %>%
+  group_by(day, trt, hour) %>%
+  summarize(length2 = mean(length2),
+            Estimate = mean(Estimate)) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_point() +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_line(aes(y=Estimate), lty=2) +
+  facet_wrap(~day, scales = "free_y")
+```
+
+```{r}
+loo_compare(fit1c, fit2c)
+```
+
+Fit2c is preferred, but predictions are not that good relative to observed
+
+```{r}
+hypothesis(fit2c, c("delta_trtWest  = 0",
+                    "delta_trtWestHeat = 0",
+                    "delta_trtWest = delta_trtWestHeat"))
+```
+
+## fit3c:
+
+```{r, eval=TRUE}
+inits3 <- function() { list(
+  b_Lmax=rnorm(1, 11.5, .25),
+  b_Lmin=rnorm(1, 7.5, .25),
+  b_delta=rexp(1, .5),
+  b_k=c(rexp(1, 1), 0, 0),
+  z_1=array(0, dim=c(72,1362))
+)
+}
+
+prior3 <- c(prior(normal(7.5,.25), nlpar="Lmin"),
+            prior(normal(11.5, .25),nlpar="Lmax"),
+            prior(exponential(1),nlpar="k"),
+            prior(normal(0,0.02), nlpar="k", coef="trtWest"),
+            prior(normal(0,0.02), nlpar="k", coef="trtWestHeat"),
+            prior(exponential(0.5),nlpar="delta") 
+)
+
+fit3c <- brm( # ignore the warning about k. 
+  formula=bf(
+    length2 | cens(censored) ~ Lmax - (Lmax - Lmin) * exp(-(k*hour)^delta), #Weibull model
+    Lmax + Lmin + delta ~ 1, 
+    k ~ trt + (1|id),   # 
+    nl=TRUE ),
+  data=anther,
+  prior=prior3,
+  sample_prior = "yes",
+  inits = inits3,
+  cores=4,
+  chains=4,
+  iter=5000,
+  control=list(adapt_delta=0.99)
+  )
+
+fit3c <- add_criterion(fit3c, "loo")
+
+gc()
+```
+
+```{r}
+summary(fit3c)
+gc()
+```
+
+```{r}
+pairs(fit3c, pars="^b_")
+```
+
+
+```{r, fig.height=10}
+plot(fit3c, ask = FALSE)
+gc()
+```
+
+```{r}
+plot(conditional_effects(fit3c), ask=FALSE)
+pp_check(fit3c)
+```
+
+```{r}
+pred3c <- predict(fit3c)
+pred3c %>%
+  cbind(anther) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_smooth(span=1) +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_smooth(aes(y=Estimate), lty=2, span=1) 
+```
+
+```{r}
+pred3c %>%
+  cbind(anther) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_smooth(span=1) +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_smooth(aes(y=Estimate), lty=2, span=1)  +
+  facet_wrap(~day, scales = "free_y")
+```
+
+
+```{r}
+pred3c %>%
+  cbind(anther) %>%
+  group_by(day, trt, hour) %>%
+  summarize(length2 = mean(length2),
+            Estimate = mean(Estimate)) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_point() +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_line(aes(y=Estimate), lty=2) +
+  facet_wrap(~day, scales = "free_y")
+```
+
+```{r}
+loo_compare(fit1c, fit2c, fit3c)
+```
+
+
+## fit_4c: k and delta ~ trt.  
+
+```{r, eval=TRUE}
+inits4 <- function() { list(
+  b_Lmax=rnorm(1, 11.5, .25),
+  b_Lmin=rnorm(1, 7.5, .25),
+  b_delta=c(rexp(1, .5), 0, 0),
+  b_k=c(rexp(1, 1), 0, 0),
+  z_1=array(0, dim=c(72,1)),
+  z_2=array(0, dim=c(72,1))
+)
+}
+
+prior4 <- c(prior(normal(7.5,.25), nlpar="Lmin"),
+            prior(normal(11.5, .25),nlpar="Lmax"),
+            prior(exponential(1),nlpar="k"),
+            prior(normal(0,0.02), nlpar="k", coef="trtWest"),
+            prior(normal(0,0.02), nlpar="k", coef="trtWestHeat"),
+            prior(exponential(0.5), nlpar="delta"), # 1 is exponential model
+            prior(normal(0,0.25), nlpar="delta", coef="trtWest"),
+            prior(normal(0,0.25), nlpar="delta", coef="trtWestHeat")
+)
+
+fit_4c <- brm(
+  formula=bf(
+    length2 | cens(censored) ~ Lmax - (Lmax - Lmin) * exp(-(k*hour)^delta), #Weibull model
+    Lmax + Lmin ~ 1, 
+    delta + k ~ trt + (1|id),   # 
+    nl=TRUE ),
+  data=anther,
+  prior=prior4,
+  inits=inits4,
+  cores=4,
+  chains=4,
+  iter=5000, control = list(adapt_delta=0.95)
+) 
+
+fit_4c <- add_criterion(fit_4c, "loo")
+
+gc()
+```
+
+```{r}
+summary(fit_4c)
+gc()
+```
+
+```{r}
+pairs(fit_4c, pars = "^b_")
+```
+
+
+```{r, fig.height=10}
+plot(fit_4c, ask = FALSE)
+gc()
+```
+
+```{r}
+plot(conditional_effects(fit_4c), ask=FALSE)
+pp_check(fit_4c)
+```
+
+```{r}
+pred_4c <- predict(fit_4c)
+pred_4c %>%
+  cbind(anther) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_smooth(span=1) +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_smooth(aes(y=Estimate), lty=2, span=1) 
+```
+
+```{r}
+pred_4c %>%
+  cbind(anther) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_smooth(span=1) +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_smooth(aes(y=Estimate), lty=2, span=1)  +
+  facet_wrap(~day, scales="free_y")
+```
+
+
+```{r}
+pred_4c %>%
+  cbind(anther) %>%
+  group_by(trt, hour) %>%
+  summarize(length2 = mean(length2),
+            Estimate = mean(Estimate)) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_line() +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_line(aes(y=Estimate), lty=2) 
+```
+
+```{r}
+pred_4c %>%
+  cbind(anther) %>%
+  group_by(day, trt, hour) %>%
+  summarize(length2 = mean(length2),
+            Estimate = mean(Estimate)) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_point() +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_line(aes(y=Estimate), lty=2) +
+  facet_wrap(~day, scales = "free_y")
+```
+
+```{r}
+loo_compare(fit1c, fit2c, fit3c, fit_4c)
+```
+
+## fit_5c: k + delta ~ trt + (1|id); Lmax ~ 1|day
+
+```{r, eval=TRUE}
+inits5 <- function() { list(
+  b_Lmax=rnorm(1, 11.5, .25),
+  b_Lmin=rnorm(1, 7.5, .25),
+  b_delta=c(rexp(1, .5), 0, 0),
+  b_k=c(rexp(1, 1), 0, 0),
+  z_1=array(0, dim=c(8,1)),
+  z_2=array(0, dim=c(72,1)),
+  z_3=array(0, dim=c(72,1))
+)
+}
+
+prior5 <- c(prior(normal(7.5,.25), nlpar="Lmin"),
+            prior(normal(11.5, .25),nlpar="Lmax"),
+            prior(exponential(1),nlpar="k"),
+            prior(normal(0,0.02), nlpar="k", coef="trtWest"),
+            prior(normal(0,0.02), nlpar="k", coef="trtWestHeat"),
+            prior(exponential(0.5), nlpar="delta"), # 1 is exponential model
+            prior(normal(0,0.25), nlpar="delta", coef="trtWest"),
+            prior(normal(0,0.25), nlpar="delta", coef="trtWestHeat")
+)
+
+fit_5c <- brm(
+  formula=bf(
+    length2 | cens(censored) ~ Lmax - (Lmax - Lmin) * exp(-(k*hour)^delta), #Weibull model
+    Lmin ~ 1, 
+    Lmax ~ (1|day),
+    delta + k ~ trt + (1|id),   # 
+    nl=TRUE ),
+  data=anther,
+  prior=prior5,
+  sample_prior = "yes",
+  inits=inits5,
+  cores=4,
+  chains=4,
+  iter=2000
+) 
+
+fit_5c <- add_criterion(fit_5c, "loo")
+
+gc()
+```
+
+```{r}
+summary(fit_5c)
+gc()
+```
+
+```{r, fig.height=10}
+plot(fit_5c, ask = FALSE)
+gc()
+```
+
+```{r}
+plot(conditional_effects(fit_5c), ask=FALSE)
+pp_check(fit_5c)
+```
+
+```{r}
+pred_5c <- predict(fit_5c)
+pred_5c %>%
+  cbind(anther) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_smooth(span=1) +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_smooth(aes(y=Estimate), lty=2, span=1) 
+```
+
+```{r}
+pred_5c %>%
+  cbind(anther) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_smooth(span=1) +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_smooth(aes(y=Estimate), lty=2, span=1)  +
+  facet_wrap(~day)
+```
+
+
+```{r}
+pred_5c %>%
+  cbind(anther) %>%
+  group_by(trt, hour) %>%
+  summarize(length2 = mean(length2),
+            Estimate = mean(Estimate)) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_line() +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_line(aes(y=Estimate), lty=2) 
+```
+
+```{r}
+pred_5c %>%
+  cbind(anther) %>%
+  group_by(day, trt, hour) %>%
+  summarize(length2 = mean(length2),
+            Estimate = mean(Estimate)) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_point() +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_line(aes(y=Estimate), lty=2) +
+  facet_wrap(~day, scales = "free_y")
+```
+
+```{r}
+loo_compare(fit1c, fit2c, fit3c, fit_4c, fit_5c)
+```
+
+
+## fit_6c:
+
+```{r, eval=TRUE}
+
+inits6 <- function() { list(
+  b_Lmax=rnorm(1, 11.5, .25),
+  b_Lmin=rnorm(1, 7.5, .25),
+  b_delta=c(rexp(1, .5), 0, 0),
+  b_k=c(rexp(1, 1), 0, 0),
+  z_1=array(0, dim=c(8,1)),
+  z_2=array(0, dim=c(8,1)),
+  z_3=array(0, dim=c(72,1)),
+  z_4=array(0, dim=c(72,1))
+)
+}
+
+prior6 <- c(prior(normal(7.5,.25), nlpar="Lmin"),
+            prior(normal(11.5, .25),nlpar="Lmax"),
+            prior(exponential(1),nlpar="k"),
+            prior(normal(0,0.04), nlpar="k", coef="trtWest"),
+            prior(normal(0,0.04), nlpar="k", coef="trtWestHeat"),
+            prior(exponential(0.5), nlpar="delta"), # 1 is exponential model
+            prior(normal(0,0.25), nlpar="delta", coef="trtWest"),
+            prior(normal(0,0.25), nlpar="delta", coef="trtWestHeat")
+)
+
+fit_6c <- brm(
+  formula=bf(
+    length2 | cens(censored) ~ Lmax - (Lmax - Lmin) * exp(-(k*hour)^delta), #Weibull model
+    Lmax + Lmin ~ (1|day),
+    delta + k ~ trt + (1|id),   # 
+    nl=TRUE ),
+  data=anther,
+  prior=prior6,
+  sample_prior = "yes",
+  inits=inits6,
+  cores=4,
+  chains=4,
+  iter=2000
+  )
+
+fit_6c <- add_criterion(fit_6c, "loo")
+
+gc()
+```
+
+
+```{r}
+summary(fit_6c)
+gc()
+```
+
+```{r, height=10}
+plot(fit_6c, ask = FALSE)
+gc()
+```
+
+```{r}
+plot(conditional_effects(fit_6c), ask=FALSE)
+pp_check(fit_6c)
+```
+
+```{r}
+pred_6c <- predict(fit_6c) 
+pred_6c %>%
+  cbind(anther) %>%
+  ggplot(aes(x=hour, y=length2, color=trt)) +
+  geom_smooth(span=1) +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_smooth(aes(y=Estimate), lty=2, span=1) 
+```
+
+```{r}
+pred_6c %>%
+  cbind(anther) %>%
+  ggplot(aes(x=hour, y=length, color=trt)) +
+  geom_smooth(span=1) +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_smooth(aes(y=Estimate), lty=2, span=1)  +
+  facet_wrap(~day, scales = "free_y")
+```
+
+```{r}
+pred_6c %>%
+  cbind(anther) %>%
+  group_by(day, trt, hour) %>%
+  summarize(length = mean(length),
+            Estimate = mean(Estimate)) %>%
+  ggplot(aes(x=hour, y=length, color=trt)) +
+  geom_point() +
+  #geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5), color="grey90", fill="black", alpha=.1) +
+  geom_line(aes(y=Estimate), lty=2) +
+  facet_wrap(~day, scales = "free_y", ncol = 4) +
+  theme(legend.position = "top")
+ggsave("../output/anther_fit_plot.pdf", width=6.5, height = 4)
+```
+
+```{r}
+save.image("../output/antherModelFits.Rdata")
+```
+
+
+## compare models
+
+```{r}
+loo_compare(fit1c, fit2c, fit3c, fit_4c, fit_5c, fit_6c)
+```
+
+
+## posterior of best model with trt effects
+
+Get the posterior
+```{r}
+post_6c <- posterior_samples(fit_6c, pars="b.*")
+```
+
+posterior for inflection point
+```{r}
+# inflection point equation
+infl.pt <- function(delta, k) {
+  (1/k) *
+    ((delta -1) / delta)^(1/delta)
+}
+
+post_6c$infl_intercept <- infl.pt(post_6c$b_delta_Intercept, post_6c$b_k_Intercept)
+
+post_6c$infl_trtWest <-
+  infl.pt(
+    post_6c$b_delta_Intercept + post_6c$b_delta_trtWest,
+    post_6c$b_k_Intercept + post_6c$b_k_trtWest)
+
+post_6c$infl_trtWestHeat <-
+  infl.pt(
+    post_6c$b_delta_Intercept+post_6c$b_delta_trtWestHeat,
+    post_6c$b_k_Intercept + post_6c$b_k_trtWestHeat)
+
+```
+
+
+```{r}
+apply(post_6c, 2, function(x) mean(x))
+```
+
+posterior probability that inflection point for trtWestHeat is greater than inflection point for East
+```{r}
+sum( (post_6c$infl_trtWestHeat > post_6c$infl_intercept )) / nrow(post_6c)
+```
+
+posterior probability that inflection point for trtWest is greater than inflection point for East
+```{r}
+sum( (post_6c$infl_trtWest > post_6c$infl_intercept )) / nrow(post_6c)
+```
+
+posterior probability that inflection point for trtWest is greater than inflection point for trtWestHeat
+```{r}
+sum((post_6c$infl_trtWest > post_6c$infl_trtWestHeat)) / nrow(post_6c)
+```
+
+posterior probability that k for trtWestHeat is less than East
+```{r}
+sum( (post_6c$b_k_trtWestHeat < 0 )) / nrow(post_6c)
+```
+
+posterior probability that k for trtWest is less than East
+```{r}
+sum( (post_6c$b_k_trtWest < 0 )) / nrow(post_6c)
+```
+
+posterior probability that k for trtWest is less than trtWestHeat
+```{r}
+sum( (post_6c$b_k_trtWest < post_6c$b_k_trtWestHeat   )) / nrow(post_6c)
+```
+
+### Plots
+
+k
+```{r, fig.width=3}
+post_6c %>%
+  as.data.frame() %>%
+  select(starts_with("b_k")) %>%
+  rename_with(~str_remove(.,"b_")) %>%
+  rename_with(~str_remove(.,"trt")) %>%
+  rename(k_East=k_Intercept) %>%
+  mutate(k_West=k_West+k_East,
+         k_WestHeat=k_WestHeat+k_East) %>%
+  summarize(across(.fns = list(mean = mean,
+                               lower = ~ rethinking::HPDI(., 0.95)[1],
+                               upper = ~ rethinking::HPDI(., 0.95)[2])
+                   )) %>%
+  pivot_longer(cols=everything(), names_to=c("trt", "parameter"), names_pattern = "k_(.*)_(.*)") %>%
+  pivot_wider(names_from = "parameter", values_from = "value") %>%
+  ggplot(aes(x=trt, y=mean, ymin=lower, ymax=upper)) +
+  geom_col(fill="skyblue") + 
+  geom_errorbar(width=.5) +
+  ylab("k") +
+  xlab("Condition") +
+  theme_bw()
+ggsave("../output/anther_k_plot.pdf", height=3, width = 3)
+```
+inflection
+```{r, fig.width=3}
+post_6c %>%
+  as.data.frame() %>%
+  select(starts_with("infl")) %>%
+  rename_with(~str_remove(.,"trt")) %>%
+  rename_with(~str_remove(.,"infl_")) %>%
+  rename(East=intercept) %>%
+  summarize(across(.fns = list(mean = mean,
+                               lower = ~ rethinking::HPDI(., 0.95)[1],
+                               upper = ~ rethinking::HPDI(., 0.95)[2])
+                   )) %>%
+  pivot_longer(cols=everything(), names_to=c("trt", "parameter"), names_pattern = "(.*)_(.*)") %>%
+  pivot_wider(names_from = "parameter", values_from = "value") %>%
+  ggplot(aes(x=trt, y=mean, ymin=lower, ymax=upper)) +
+  geom_col(fill="red") + 
+  geom_errorbar(width=.5) +
+  ylab("Inflection Point") +
+  xlab("Condition") +
+  theme_bw()
+ggsave("../output/anther_inflection_plot.pdf", height=3, width = 3)
+```
+
